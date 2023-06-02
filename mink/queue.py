@@ -39,7 +39,7 @@ def init():
                 app.logger.debug(f"Job in cache: '{g.cache.get_job(job.corpus_id)}'")
             # Queue job unless it is done, aborted or erroneous
             if job.corpus_id not in queue:
-                if not jobs.Status.is_done_processing(job.status) and not jobs.Status.is_inactive(job.status):
+                if not job.status.is_done(job.current_process) and not job.status.is_inactive():
                     queue.append(job.corpus_id)
         g.cache.set_job_queue(queue)
         g.cache.set_all_jobs(all_jobs)
@@ -47,18 +47,14 @@ def init():
         app.logger.debug(f"All jobs in cache: {g.cache.get_all_jobs()}")
 
 
-def add(job, install=False):
+def add(job):
     """Add a job item to the queue."""
     queue = g.cache.get_job_queue()
 
     # Avoid starting multiple jobs for the same corpus simultaneously
-    if job.corpus_id in queue and jobs.Status.is_active(job.status):
+    if job.corpus_id in queue and job.status.is_active():
         raise Exception("There is an unfinished job for this corpus!")
 
-    if install:
-        job.set_status(jobs.Status.waiting_install)
-    else:
-        job.set_status(jobs.Status.waiting)
     # Unqueue if old job is queued since before
     if job.corpus_id in queue:
         queue.pop(queue.index(job.corpus_id))
@@ -123,9 +119,9 @@ def get_running_waiting():
     queue = g.cache.get_job_queue()
     for j in queue:
         job = jobs.load_from_str(g.cache.get_job(j))
-        if jobs.Status.is_running(job.status):
+        if job.status.is_running():
             running_jobs.append(job)
-        elif jobs.Status.is_waiting(job.status):
+        elif job.status.is_waiting():
             waiting_jobs.append(job)
 
     return running_jobs, waiting_jobs
@@ -137,7 +133,7 @@ def unqueue_inactive():
     old_jobs = []
     for j in queue:
         job = jobs.load_from_str(g.cache.get_job(j))
-        if jobs.Status.is_inactive(job.status):
+        if job.status.is_inactive():
             old_jobs.append(j)
 
     if old_jobs:

@@ -9,6 +9,7 @@ from flask import request, session
 from mink import exceptions, jobs, queue, utils
 from mink.sb_auth import login
 from mink.sparv import storage
+from mink.status import JobStatuses, ProcessName, Status
 
 bp = Blueprint("sparv", __name__)
 
@@ -74,7 +75,7 @@ def run_sparv(user_id: str, contact: str, corpus_id: str):
     job.check_requirements()
 
     if storage.local:
-        job.set_status(jobs.Status.waiting)
+        job.set_status(Status.waiting, ProcessName.sparv)
     else:
         # Sync files
         try:
@@ -115,12 +116,13 @@ def advance_queue():
     while waiting_jobs and len(running_jobs) < app.config.get("SPARV_WORKERS", 1):
         job = waiting_jobs.pop(0)
         try:
-            if job.status == jobs.Status.waiting:
-                job.run_sparv()
-                app.logger.info(f"Started annotation process for '{job.corpus_id}'")
-            elif job.status == jobs.Status.waiting_install:
-                job.install_korp()
-                app.logger.info(f"Started installation process for '{job.corpus_id}'")
+            if job.status.is_waiting():
+                if job.current_process == ProcessName.sparv.name:
+                    job.run_sparv()
+                    app.logger.info(f"Started annotation process for '{job.corpus_id}'")
+                elif job.current_process == ProcessName.korp.name:
+                    job.install_korp()
+                    app.logger.info(f"Started installation process for '{job.corpus_id}'")
             running_jobs.append(job)
         except Exception as e:
             app.logger.error(f"Failed to run Sparv on '{job.corpus_id}' {str(e)}")
@@ -141,7 +143,7 @@ def check_status(corpora: list):
                                       err=True), 404
             job = queue.get_job_by_corpus_id(corpus_id)
             if not job:
-                return utils.response(f"There is no active job for '{corpus_id}'", job_status=jobs.Status.none.name)
+                return utils.response(f"There is no active job for '{corpus_id}'", job_status=JobStatuses())
 
             return make_status_response(job, admin=session.get("admin_mode", False))
         except Exception as e:
@@ -170,18 +172,18 @@ def abort_job(corpus_id: str):
     """Try to abort a running job."""
     job = jobs.get_job(corpus_id)
     # Syncing
-    if jobs.Status.is_syncing(job.status):
-        return utils.response(f"Cannot abort job while syncing files", job_status=job.status.name), 503
+    if job.status.is_syncing():
+        return utils.response(f"Cannot abort job while syncing files", job_status=job.status), 503
     # Waiting
-    if jobs.Status.is_waiting(job.status):
+    if job.status.is_waiting():
         try:
             queue.remove(job)
-            job.set_status(job.status.aborted)
-            return utils.response(f"Successfully unqueued job for '{corpus_id}'", job_status=job.status.name)
+            job.set_status(Status.aborted)
+            return utils.response(f"Successfully unqueued job for '{corpus_id}'", job_status=job.status)
         except Exception as e:
             return utils.response(f"Failed to unqueue job for '{corpus_id}'", err=True, info=str(e)), 500
     # No running job
-    if not jobs.Status.is_running(job.status):
+    if not job.status.is_running():
         return utils.response(f"No running job found for '{corpus_id}'")
     # Running job, try to abort
     try:
@@ -190,7 +192,7 @@ def abort_job(corpus_id: str):
         return utils.response(f"No running job found for '{corpus_id}'")
     except Exception as e:
         return utils.response(f"Failed to abort job for '{corpus_id}'", err=True, info=str(e)), 500
-    return utils.response(f"Successfully aborted running job for '{corpus_id}'", job_status=job.status.name)
+    return utils.response(f"Successfully aborted running job for '{corpus_id}'", job_status=job.status)
 
 
 @bp.route("/clear-annotations", methods=["DELETE"])
@@ -199,7 +201,7 @@ def clear_annotations(corpus_id: str):
     """Remove annotation files from Sparv server."""
     # Check if there is an active job
     job = jobs.get_job(corpus_id)
-    if jobs.Status.is_running(job.status):
+    if job.status.is_running():
         return utils.response("Cannot clear annotations while a job is running", err=True), 503
 
     try:
@@ -238,11 +240,11 @@ def install_corpus(user_id: str, contact: str, corpus_id: str):
     job.reset_time()
     job.set_install_scrambled(scramble)
     try:
-        job = queue.add(job, install=True)
+        job = queue.add(job)
     except Exception as e:
         return utils.response(f"Failed to queue job for '{corpus_id}'", err=True, info=str(e)), 500
 
-    job.set_status(jobs.Status.waiting_install)
+    job.set_status(Status.waiting, ProcessName.korp)
 
     # Wait a few seconds to check whether anything terminated early
     time.sleep(3)
@@ -252,15 +254,15 @@ def install_corpus(user_id: str, contact: str, corpus_id: str):
 def make_status_response(job, admin=False):
     """Check the annotation status for a given corpus and return response."""
     status = job.status
-    job_attrs = {"job_status": status.name, "sparv_exports": job.sparv_exports, "available_files": job.available_files,
-                 "installed_korp": job.installed_korp}
+    job_attrs = {"job_status": status.dump(), "sparv_exports": job.sparv_exports,
+                 "available_files": job.available_files, "installed_korp": job.installed_korp}
     warnings, errors, misc_output = job.get_output()
 
     job_attrs["files"] = job.files or ""
     if job.install_scrambled is not None:
         job_attrs["install_scrambled"] = job.install_scrambled
-    if job.latest_status is not None:
-        job_attrs["latest_status"] = job.latest_status.name
+    if job.current_process is not None:
+        job_attrs["current_process"] = job.current_process
     job_attrs["seconds_taken"] = job.seconds_taken or ""
     job_attrs["last_run_started"] = job.started or ""
     job_attrs["last_run_ended"] = job.done or ""
@@ -269,27 +271,24 @@ def make_status_response(job, admin=False):
     if admin:
         job_attrs["user"] = job.contact
 
-    if status == jobs.Status.none:
-        return utils.response(f"There is no active job for '{job.corpus_id}'", job_status=status.name)
+    if status.is_none():
+        return utils.response(f"There is no active job for '{job.corpus_id}'", job_status=status.dump())
 
-    if status == jobs.Status.syncing_corpus:
-        return utils.response("Corpus files are being synced to the Sparv server", **job_attrs)
+    if status.is_syncing():
+        return utils.response("Files are being synced", **job_attrs)
 
-    if status == jobs.Status.waiting:
-        return utils.response("Job has been queued for annotation", **job_attrs, priority=queue.get_priority(job))
+    if status.is_waiting():
+        return utils.response("Job has been queued", **job_attrs, priority=queue.get_priority(job))
 
-    if status == jobs.Status.waiting_install:
-        return utils.response("Job has been queued for installation", **job_attrs, priority=queue.get_priority(job))
-
-    if status == jobs.Status.aborted:
+    if status.is_aborted(job.current_process):
         return utils.response("Job was aborted by the user", **job_attrs)
 
-    if status == jobs.Status.annotating:
-        return utils.response("Sparv is running", warnings=warnings, errors=errors, sparv_output=misc_output,
+    if status.is_running():
+        return utils.response("Job is running", warnings=warnings, errors=errors, sparv_output=misc_output,
                               **job_attrs)
 
     # If done annotating, retrieve exports from Sparv
-    if status == jobs.Status.done_annotating and not admin:
+    if status.is_done(ProcessName.sparv) and not admin:
         try:
             job.sync_results()
         except Exception as e:
@@ -298,28 +297,17 @@ def make_status_response(job, admin=False):
         return utils.response("Sparv was run successfully! Starting to sync results", warnings=warnings, errors=errors,
                               sparv_output=misc_output, **job_attrs)
 
-    if status == jobs.Status.syncing_results:
-        return utils.response("Result files are being synced from the Sparv server", **job_attrs)
-
-    if status == jobs.Status.done_syncing:
-        return utils.response("Corpus is done processing and the results have been synced", warnings=warnings,
-                              errors=errors, sparv_output=misc_output, **job_attrs)
-
-    if status == jobs.Status.installing:
-        return utils.response("Korp installation is in progress", warnings=warnings, errors=errors,
+    if status.is_done(job.current_process):
+        return utils.response("Job was completed successfully!", warnings=warnings, errors=errors,
                               sparv_output=misc_output, **job_attrs)
 
-    if status == jobs.Status.done_installing:
-        return utils.response("Installation on Korp was successful!", warnings=warnings, errors=errors,
-                              sparv_output=misc_output, **job_attrs)
-
-    if status == jobs.Status.error:
+    if status.is_error(job.current_process):
         app.logger.error(f"An error occurred during processing, warnings: {warnings}, errors: {errors}, "
                          f"sparv_output: {misc_output}, job_attrs: {job_attrs}")
         return utils.response("An error occurred during processing", warnings=warnings, errors=errors,
                               sparv_output=misc_output, **job_attrs)
 
-    return utils.response("Cannot handle this Sparv status yet", warnings=warnings, errors=errors,
+    return utils.response("Cannot handle this Job status yet", warnings=warnings, errors=errors,
                           sparv_output=misc_output, **job_attrs), 501
 
 

@@ -1,18 +1,17 @@
 # Changelog
 
-## [1.?.?] - date
+## [1.1.0] - 2024-01-05
 
 ### Added
+
+- Added new resource type: metadata YAML files. There are now calls for creating, uploading and downloading these.
+- It is now possible to upload of source files with uppercase file extensions.
 
 ### Changed
 
 - The corpus registry and the job queue have been combined. Now, upon resource creation a job item is created immediately
   (instead of it being created first upon starting a Sparv job).
 - The `/check-status`-call has been replaced with `/resource-info` with a different response format.
-
-
-### Fixed
-
 
 
 ## [1.0.0] - 2023-09-19

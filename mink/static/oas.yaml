@@ -1,7 +1,7 @@
 openapi: 3.0.0
 info:
   title: Mink API
-  version: 1.0.0
+  version: 1.1.0
   description: "# Introduction\nWeb API serving as a backend to Mink.\n\nFor now the\
     \ API is used for uploading corpus data to a storage server and processing that\
     \ data with Sparv.\n\n# Workflow\nA workflow for processing data with Sparv via\
